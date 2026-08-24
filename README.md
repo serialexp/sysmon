@@ -32,6 +32,54 @@ ceiling so they're directly comparable, and names the current bottleneck.
 ╰───────────────────────────────────────────────────────────────────────╯
 ```
 
+## Installation
+
+Install the latest published release on Linux (x86-64 or ARM64):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/serialexp/sysmon/master/install.sh | sh
+```
+
+The installer downloads the matching statically linked binary from the latest
+[GitHub release](https://github.com/serialexp/sysmon/releases), verifies it
+against the release's SHA-256 checksums, and installs it to `/usr/local/bin` when
+that directory is writable or to `~/.local/bin` otherwise. Set
+`SYSMON_INSTALL_DIR` to choose another location:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/serialexp/sysmon/master/install.sh \
+  | SYSMON_INSTALL_DIR="$HOME/bin" sh
+```
+
+For full per-process disk-I/O attribution, run `sysmon --grant` once after
+installing or upgrading; replacing the executable removes its file capability.
+See [Full I/O attribution](#full-io-attribution) for the permission model.
+
+### Building from source
+
+Requires Linux and a current stable Rust toolchain:
+
+```sh
+git clone https://github.com/serialexp/sysmon.git
+cd sysmon
+cargo build --release --locked
+./target/release/sysmon
+```
+
+`just install` builds from the current checkout and installs with Cargo.
+
+### Publishing a release
+
+Release tags are `v<version>` and must match the version in `Cargo.toml`. Pushing
+a tag builds statically linked x86-64 and ARM64 Linux archives, generates
+`SHA256SUMS`, and publishes a GitHub release with generated notes:
+
+```sh
+# after updating Cargo.toml and Cargo.lock and committing that change
+git tag v0.1.0
+git push origin v0.1.0
+```
+
 ## What makes it different: saturation, not throughput
 
 The hard part of "what's slow" is that each resource means "busy" differently,

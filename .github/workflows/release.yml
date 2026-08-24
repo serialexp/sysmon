@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  APP_NAME: sysmon
+
+jobs:
+  validate-version:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Validate tag against Cargo package version
+        shell: bash
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          if [[ "$tag_version" != "$cargo_version" ]]; then
+            echo "::error::Version mismatch: tag is $tag_version but Cargo.toml is $cargo_version"
+            exit 1
+          fi
+
+  build-linux:
+    needs: validate-version
+    if: always() && (needs.validate-version.result == 'success' || needs.validate-version.result == 'skipped')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install musl linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Install Rust target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Verify release binary
+        shell: bash
+        run: |
+          binary="target/${{ matrix.target }}/release/${APP_NAME}"
+          test -x "$binary"
+          "$binary" --version
+          if ! file "$binary" | grep -q 'static'; then
+            echo "::error::Release binary is not statically linked"
+            file "$binary"
+            exit 1
+          fi
+
+      - name: Package tarball
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          archive="${APP_NAME}-${version}-${{ matrix.target }}.tar.gz"
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/${APP_NAME}" dist/
+          cp README.md dist/
+          tar -C dist -czf "$archive" "${APP_NAME}" README.md
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.APP_NAME }}-*-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build-linux
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        working-directory: artifacts
+        run: sha256sum *.tar.gz > SHA256SUMS
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.tar.gz
+            artifacts/SHA256SUMS
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}

@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 description = "A terminal system monitor that shows CPU, memory, disk, and network saturation at once and names the current bottleneck."
 license = "MIT"
+repository = "https://github.com/serialexp/sysmon"
+readme = "README.md"
 
 [[bin]]
 name = "sysmon"
