@@ -15,6 +15,17 @@ use app::App;
 const TICK: Duration = Duration::from_millis(1000);
 
 fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("sysmon {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     // One-time privilege setup: grant this binary CAP_SYS_PTRACE so an
     // unprivileged user gets full per-process I/O attribution afterwards.
     if std::env::args().any(|a| a == "--grant") {
@@ -41,10 +52,56 @@ fn main() -> anyhow::Result<()> {
         return snapshot();
     }
 
+    // Anything left that looks like a flag is a typo — fail loudly instead of
+    // silently launching the TUI (which hid `--dumpp` and friends before).
+    const KNOWN: &[&str] = &[
+        "--grant",
+        "--sudo",
+        "--dump",
+        "--snapshot",
+        "--help",
+        "-h",
+        "--version",
+        "-V",
+    ];
+    if let Some(bad) = args
+        .iter()
+        .find(|a| a.starts_with('-') && !KNOWN.contains(&a.as_str()))
+    {
+        eprintln!("sysmon: unknown option '{bad}'\nTry 'sysmon --help' for usage.");
+        std::process::exit(2);
+    }
+
     let mut terminal = ratatui::init();
     let result = run(&mut terminal);
     ratatui::restore();
     result
+}
+
+/// Usage text for `--help`. Kept terse; the README has the full story.
+fn print_help() {
+    println!(
+        "sysmon {} — show CPU, memory, disk and network saturation at once,\n\
+         and name whichever one is the current bottleneck.\n\
+         \n\
+         USAGE:\n    \
+         sysmon [OPTIONS]\n\
+         \n\
+         OPTIONS:\n    \
+         --grant       grant this binary CAP_SYS_PTRACE (one-time, via sudo) for\n                  \
+         full per-process I/O attribution, then exit\n    \
+         --sudo        run the TUI as root (full attribution on any kernel)\n    \
+         --dump        print one derived sample as text and exit (no TTY needed)\n    \
+         --snapshot    render one UI frame to a text grid and exit\n    \
+         -h, --help    print this help and exit\n    \
+         -V, --version print version and exit\n\
+         \n\
+         KEYS (in the TUI):\n    \
+         q quit   1-4 sort CPU/Mem/Disk/Net   0 auto   / search   F3 next hit\n    \
+         (n/N)   ↑↓ select   Home/End top/bottom   PgUp/PgDn page   F9/k kill process\n    \
+         space pause   Esc back/quit",
+        env!("CARGO_PKG_VERSION"),
+    );
 }
 
 /// Grant this executable `CAP_SYS_PTRACE` (effective+permitted) by writing the
@@ -64,7 +121,10 @@ fn grant() -> anyhow::Result<()> {
     // path, so PATH is irrelevant. sudo prompts for the password on this TTY.
     if unsafe { libc::geteuid() } != 0 {
         eprintln!("Setting a file capability needs root — re-running under sudo…");
-        let err = std::process::Command::new("sudo").arg(&exe).arg("--grant").exec();
+        let err = std::process::Command::new("sudo")
+            .arg(&exe)
+            .arg("--grant")
+            .exec();
         return Err(anyhow::Error::new(err).context("failed to invoke sudo"));
     }
 
@@ -175,7 +235,7 @@ fn snapshot() -> anyhow::Result<()> {
 }
 
 fn dump() -> anyhow::Result<()> {
-    use util::{fmt_bits, fmt_bytes, fmt_rate};
+    use util::{fmt_bits, fmt_bytes, fmt_latency, fmt_rate};
 
     let mut app = App::new();
     app.on_tick();
@@ -205,6 +265,20 @@ fn dump() -> anyhow::Result<()> {
         m.cpu.iowait * 100.0,
         m.cpu.per_core.len()
     );
+    let psi = |p: Option<f64>| {
+        p.map(|v| format!("{:.1}%", v * 100.0))
+            .unwrap_or_else(|| "n/a".into())
+    };
+    println!(
+        "Load    {:.2} / {:.2} / {:.2}  ({} cores)",
+        m.load.one, m.load.five, m.load.fifteen, m.load.cores
+    );
+    println!(
+        "PSI     cpu(some) {}   mem(some) {}   io(some) {}",
+        psi(m.psi.cpu.some),
+        psi(m.psi.mem.some),
+        psi(m.psi.io.some)
+    );
     println!(
         "Memory  {:>5.1}%   {} / {}   swap {} / {}{}",
         m.mem.used_frac * 100.0,
@@ -215,10 +289,13 @@ fn dump() -> anyhow::Result<()> {
         if m.mem.swapping { "  (swapping)" } else { "" }
     );
     println!(
-        "Disk    util {:>4.1}%   R {}  W {}",
+        "Disk    util {:>4.1}%   R {}  W {}   await {}  aqu {:.2}  iowait {:.1}%",
         m.disk.util * 100.0,
         fmt_rate(m.disk.read_bps),
-        fmt_rate(m.disk.write_bps)
+        fmt_rate(m.disk.write_bps),
+        fmt_latency(m.disk.await_ms),
+        m.disk.aqu_sz,
+        m.disk.iowait * 100.0,
     );
     for d in &m.disk.per_device {
         println!(
@@ -243,7 +320,10 @@ fn dump() -> anyhow::Result<()> {
         ),
     }
     for i in &m.net.per_iface {
-        let sat = i.sat.map(|s| format!("{:.1}%", s * 100.0)).unwrap_or_else(|| "n/a".into());
+        let sat = i
+            .sat
+            .map(|s| format!("{:.1}%", s * 100.0))
+            .unwrap_or_else(|| "n/a".into());
         println!(
             "          {:<10} speed {:?}  sat {}  Rx {}  Tx {}",
             i.name,
@@ -264,11 +344,15 @@ fn dump() -> anyhow::Result<()> {
     );
 
     let mut procs: Vec<_> = m.procs.iter().collect();
-    procs.sort_by(|x, y| y.cpu_frac.partial_cmp(&x.cpu_frac).unwrap_or(std::cmp::Ordering::Equal));
-    println!("\nTop 5 by CPU:");
+    procs.sort_by(|x, y| {
+        y.cpu_frac
+            .partial_cmp(&x.cpu_frac)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    println!("\nTop 5 processes by CPU:");
     for p in procs.iter().take(5) {
         println!(
-            "  {:>7} {:<24} {:>5.1}%  rss {}",
+            "  {:>7} {:<28} {:>5.1}%  rss {}",
             p.pid,
             p.comm,
             p.cpu_frac * 100.0,

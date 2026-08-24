@@ -33,6 +33,22 @@ pub fn fmt_rate(bytes_per_sec: f64) -> String {
     }
 }
 
+/// A latency given in milliseconds, rendered at a readable scale: sub-ms as
+/// microseconds, then ms, then seconds for pathological queues. Used for disk
+/// `await` where values span µs (NVMe cache hit) to seconds (thrashing).
+pub fn fmt_latency(ms: f64) -> String {
+    let ms = ms.max(0.0);
+    if ms < 1.0 {
+        format!("{:.0}µs", ms * 1000.0)
+    } else if ms < 10.0 {
+        format!("{ms:.1}ms")
+    } else if ms < 1000.0 {
+        format!("{ms:.0}ms")
+    } else {
+        format!("{:.1}s", ms / 1000.0)
+    }
+}
+
 /// A byte-rate expressed in *bits* per second (Mb/s), the convention for
 /// network links.
 pub fn fmt_bits(bytes_per_sec: f64) -> String {

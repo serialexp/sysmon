@@ -8,10 +8,24 @@ use std::path::Path;
 pub struct DiskCounters {
     pub sectors_read: u64,
     pub sectors_written: u64,
+    /// Completed read/write requests (diskstats fields 3 and 7). The summed
+    /// delta is the denominator for `await` (service ms per completed request).
+    pub reads: u64,
+    pub writes: u64,
+    /// Cumulative ms spent servicing reads/writes (fields 6 and 10). Their
+    /// summed delta ÷ (Δreads+Δwrites) is `await`: average latency per request,
+    /// which separates fast-and-deep from slow-and-shallow at the same %util.
+    pub ms_read: u64,
+    pub ms_written: u64,
     /// `io_ticks`: milliseconds during which the device had I/O in flight.
     /// Its delta over an interval, divided by the interval, is device
     /// utilisation (the `%util` iostat reports) — the honest saturation signal.
     pub io_ticks: u64,
+    /// `weighted_io_ticks` (field 13): time-integral of the in-flight request
+    /// count. Its delta ÷ interval-ms is the average queue depth (`aqu-sz`) —
+    /// how many I/Os were outstanding on average, which separates a device that's
+    /// busy-with-idle-capacity from one that's genuinely backed up.
+    pub weighted_io_ticks: u64,
 }
 
 /// A disk sector is 512 bytes in `/proc/diskstats`, always, regardless of the
@@ -61,7 +75,12 @@ pub fn read(devices: &HashSet<String>) -> HashMap<String, DiskCounters> {
             DiskCounters {
                 sectors_read: g(5),
                 sectors_written: g(9),
+                reads: g(3),
+                writes: g(7),
+                ms_read: g(6),
+                ms_written: g(10),
                 io_ticks: g(12),
+                weighted_io_ticks: g(13),
             },
         );
     }

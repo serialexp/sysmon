@@ -48,14 +48,78 @@ Each axis is reduced to a `0–100%` saturation so the four are comparable, and 
 verdict line names whichever is highest. Colours: green `<50%`, yellow `<80%`,
 red `≥80%`.
 
+Because `%util` saturates the moment the device is simply *never idle* — it hits
+100% for a trickle of slow random I/O just as easily as for a full sequential
+stream — the disk pane also shows **`await`** (average service latency per
+completed request) and **`aqu`** (average queue depth). Together they make the
+number legible: 100% util with sub-millisecond `await` and `aqu ≈ 1` is a device
+that's busy but keeping up; high `await` with a deep queue is genuine backlog.
+The `stall` (PSI-io) figure is the tiebreaker for whether that occupancy is
+actually delaying anyone.
+
+### PSI: the kernel's own "am I stalling?" signal
+
+Where the kernel provides it (`/proc/pressure/{cpu,memory,io}`, Linux 4.20+),
+sysmon reads **Pressure Stall Information** — the fraction of recent wall-clock
+time during which tasks were *actually delayed* waiting on a resource (`some
+avg10`). It's shown as `stall N%` on the CPU, Memory, and Disk panes.
+
+PSI is strictly more honest than the level/throughput proxies: a box with RAM
+full of cache reads ~0% memory stall, and a disk pinned at 100% `%util` that's
+still keeping up reads ~0% I/O stall. Because of that, **the verdict for CPU,
+memory and disk is driven by PSI** — the tool asks "were tasks actually
+*delayed*?", not "is the resource busy?". So it no longer calls memory the
+bottleneck just because RAM is full of cache, nor disk because `%util` is high
+while it keeps up. On kernels without PSI each axis falls back to its utilization
+proxy (`busy%` / `used% + swapping` / `%util`).
+
+This is deliberately a *degradation* model, not a *utilization* one, and it cuts
+the other way too: a box pegged at 100% CPU doing real work with no run-queue
+backlog stalls no one, so PSI reads ~0 and the verdict stays clear even though
+the CPU gauge is full. The gauges still show utilization (with the `stall N%`
+figure beside them), so you always see both the level and whether it's hurting —
+they can legitimately disagree, and that disagreement is the point.
+
+> **Note on thresholds.** The same `50% / 80%` elevated/saturated cut-offs are
+> applied to PSI as to utilization, even though PSI runs on a different natural
+> scale (20–30% stall is already real pain). So today the verdict is
+> conservative — it names a bottleneck only under heavy stall. Retuning the PSI
+> thresholds is a tracked follow-up.
+
+**Load average** (`/proc/loadavg`, shown by the CPU pane as `load 1min / cores`)
+complements instantaneous CPU busy%: it counts runnable *and* uninterruptible
+(D-state) tasks, so a load well above the core count with only moderate CPU% is
+the tell-tale of I/O contention rather than compute.
+
 ## The process table follows the bottleneck
 
-Instead of a generic process list, the bottom pane sorts by *whichever resource
-is currently the bottleneck* — CPU-bound? top CPU hogs. Disk-bound? top I/O
-writers. It answers the natural follow-up: "disk is slow — **who's doing it?**"
+The bottom pane shows **one row per userspace process**. CPU, resident memory,
+and readable disk-I/O rates belong only to the displayed PID; a process's
+children are never rolled into it merely because it launched them. Linux
+userspace threads are already represented by their thread-group leader in
+`/proc/<pid>`, while the complete process forest below `kthreadd` (PID 2) is
+hidden. This matches htop's useful default distinction without guessing which
+processes constitute a conceptual application.
 
-Ties fall back to CPU then RSS, so you always see *active* processes rather than
-idle kernel threads in random order.
+The table sorts processes by *whichever resource is currently the bottleneck* —
+CPU-bound? top CPU processes. Disk-bound? top I/O processes. CPU, RSS, and I/O
+are three-sample rolling averages (about three seconds at the default refresh),
+so a single one-second burst has less power to reshuffle the table. New processes
+warm up from the observations available so genuine new work appears immediately.
+Ties fall back to CPU then RSS, so active processes naturally rise above idle
+ones. Rolling histories are keyed by PID plus `/proc/<pid>/stat` start time, so a
+reused PID never inherits its predecessor's values.
+
+The command label is derived from `/proc/<pid>/cmdline` (executable plus its
+first useful argument) rather than relying only on the kernel task name. That
+distinguishes runtimes that otherwise use generic names such as `MainThread` —
+for example, `node server.mjs` versus `node vite.js`. The `S` column is the
+process's scheduler state, so a process stuck **`D`** (uninterruptible sleep —
+blocked in the kernel on I/O) stands out in red. `R` running is green, `Z`
+zombie magenta.
+
+Killing a selected row signals only that displayed PID. It does not implicitly
+signal descendants whose resource usage is shown in their own rows.
 
 ## Honesty about what it can and can't see
 
@@ -94,15 +158,22 @@ Keys:
 | `0`      | auto — follow the current bottleneck (default)                      |
 | `/`      | incremental process search (matches command or PID)                |
 | `F3`     | jump to the next search hit (`Shift+F3` for the previous)           |
+| `n` `N`  | next / previous hit — aliases for `F3` when the terminal eats it    |
 | `↑` `↓`  | move the selection through the list                                 |
+| `Home` `End` | select the first / last visible process                          |
+| `Page Up` `Page Down` | move the selection by ten rows, clamped at the list ends    |
 | `F9`/`k` | kill the selected process (`Enter` = SIGTERM, `k` = SIGKILL)        |
+| `space`  | freeze / unfreeze the display (a `PAUSED` badge appears)            |
 | `Esc`    | close search / kill, then clear the selection, then quit           |
 
-The selection is **locked to a PID**, so once you've searched for a process the
-highlight follows it as the table reshuffles each second — you're always looking
-at the same process, not whatever happens to sit on that row. `F3` walks the
-matches in display order; killing another user's process needs privilege (run
-under `sudo`, or the kill reports the kernel's `EPERM`).
+There's also `sysmon --help` and `sysmon --version`; an unrecognised flag now
+exits with an error instead of silently launching the TUI.
+
+The selection is **locked to a PID and process start time**, so once you've
+searched for a process the highlight follows that exact process lifetime as the
+table reshuffles each second — a recycled PID cannot inherit the highlight or a
+kill action. `F3` walks matches in display order; killing another user's process
+needs privilege (run under `sudo`, or the kill reports the kernel's `EPERM`).
 
 ### Full I/O attribution
 
@@ -170,7 +241,12 @@ delta between two samples:
   filtered by the `device` symlink under `/sys/block`
 - **Network** — `/proc/net/dev` (rx/tx bytes) + `/sys/class/net/*/speed`,
   filtered to interfaces with a `device` symlink
-- **Processes** — `/proc/<pid>/stat` (CPU, RSS) and `/proc/<pid>/io` (block I/O)
+- **Pressure** — `/proc/pressure/{cpu,memory,io}` (`some avg10`) and
+  `/proc/loadavg` (1/5/15-minute load)
+- **Processes** — `/proc/<pid>/stat` (parent PID, CPU, RSS, state),
+  `/proc/<pid>/cmdline` (human-useful command labels), and `/proc/<pid>/io`
+  (block I/O); each userspace PID remains independently accountable, while the
+  process forest rooted at `kthreadd` is hidden
 
 Linux only (it's `/proc`-native by design). Built with
 [ratatui](https://ratatui.rs).

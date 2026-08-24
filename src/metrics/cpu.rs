@@ -17,7 +17,12 @@ pub struct CpuTimes {
 
 impl CpuTimes {
     fn parse(fields: &[&str]) -> Self {
-        let g = |i: usize| fields.get(i).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        let g = |i: usize| {
+            fields
+                .get(i)
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0)
+        };
         CpuTimes {
             user: g(0),
             nice: g(1),

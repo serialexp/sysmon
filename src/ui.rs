@@ -4,7 +4,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Gauge, Paragraph, Row, Sparkline, Table},
+    widgets::{Cell, Gauge, Paragraph, Row, Sparkline, Table},
     Frame,
 };
 
@@ -12,15 +12,13 @@ use crate::app::{App, InputMode};
 use crate::bottleneck::{self, Assessment, Axis, CLEAR, SATURATED};
 use crate::history::History;
 use crate::metrics::{IoHint, Metrics, ProcSample};
-use crate::util::{fmt_bits, fmt_bytes, fmt_rate};
+use crate::util::{fmt_bits, fmt_bytes, fmt_latency, fmt_rate};
 
 pub fn render(f: &mut Frame, app: &App) {
     let area = f.area();
 
     let Some(m) = &app.metrics else {
-        let p = Paragraph::new("Collecting first sample…")
-            .alignment(Alignment::Center)
-            .block(title_block(" sysmon "));
+        let p = Paragraph::new("Collecting first sample…").alignment(Alignment::Center);
         f.render_widget(p, area);
         return;
     };
@@ -31,16 +29,19 @@ pub fn render(f: &mut Frame, app: &App) {
     // the message never gets truncated off a block title. `io_hint` is `Full`
     // under root (or when nothing was denied), so this line isn't drawn there.
     let banner_h = if m.io_hint == IoHint::Full { 0 } else { 1 };
+    // A 1-column side margin (in place of the old borders) keeps text off the
+    // very edge of the terminal without boxing anything in.
     let rows = Layout::vertical([
-        Constraint::Length(3),        // verdict
+        Constraint::Length(1),        // verdict
         Constraint::Min(9),           // 2x2 grid
         Constraint::Length(banner_h), // I/O-permission banner (conditional)
         Constraint::Length(12),       // process table
         Constraint::Length(1),        // help
     ])
+    .horizontal_margin(1)
     .split(area);
 
-    render_verdict(f, rows[0], &assess);
+    render_verdict(f, rows[0], &assess, app.paused);
     render_grid(f, rows[1], m, app);
     if banner_h > 0 {
         render_io_banner(f, rows[2], m.io_hint);
@@ -85,7 +86,9 @@ fn render_search_line(f: &mut Frame, area: Rect, m: &Metrics, app: &App) {
         Span::raw(" "),
         Span::styled(
             app.search_query.clone(),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
         // Block cursor so the (possibly empty) input is visibly focused.
         Span::styled("▏", Style::default().fg(Color::Cyan)),
@@ -96,7 +99,10 @@ fn render_search_line(f: &mut Frame, area: Rect, m: &Metrics, app: &App) {
 }
 
 fn render_kill_line(f: &mut Frame, area: Rect, m: &Metrics, app: &App) {
-    let pid = app.selected_pid.unwrap_or(0);
+    let pid = app
+        .selected_process
+        .map(|identity| identity.pid)
+        .unwrap_or(0);
     let comm = m
         .procs
         .iter()
@@ -107,7 +113,7 @@ fn render_kill_line(f: &mut Frame, area: Rect, m: &Metrics, app: &App) {
     let key = Style::default().add_modifier(Modifier::REVERSED);
     let dim = Style::default().fg(Color::DarkGray);
     let line = Line::from(vec![
-        Span::styled(format!(" Kill {pid} ({comm})? "), warn),
+        Span::styled(format!(" Kill process {pid} ({comm})? "), warn),
         Span::raw("  "),
         Span::styled(" Enter ", key),
         Span::styled(" SIGTERM   ", dim),
@@ -144,18 +150,8 @@ fn render_io_banner(f: &mut Frame, area: Rect, hint: IoHint) {
         IoHint::CapInert => (" sysmon --sudo", " — full I/O (needs root)"),
         IoHint::Full => return,
     };
-    let line = Line::from(vec![
-        Span::styled(command, cmd),
-        Span::styled(note, expl),
-    ]);
+    let line = Line::from(vec![Span::styled(command, cmd), Span::styled(note, expl)]);
     f.render_widget(Paragraph::new(line), area);
-}
-
-fn title_block(title: &str) -> Block<'_> {
-    Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .title(title.to_string())
 }
 
 /// Green below CLEAR, yellow up to SATURATED, red at/above it.
@@ -169,86 +165,133 @@ fn sat_color(s: f64) -> Color {
     }
 }
 
-fn render_verdict(f: &mut Frame, area: Rect, a: &Assessment) {
-    // Markers are ASCII on purpose: emoji glyphs like ⚠/✓ render as two cells in
-    // some terminals (notably browser/xterm.js) while ratatui budgets one, which
-    // shifts the rest of the row right and spills the border. ASCII, box-drawing,
-    // and block elements are the only reliably single-width glyphs.
-    let (icon, msg, color) = if a.worst_sat < CLEAR {
-        (
-            "[ok]",
-            "All clear — no resource is saturated".to_string(),
-            Color::Green,
-        )
-    } else if a.worst_sat < SATURATED {
-        (
-            "[~]",
-            format!(
-                "Elevated: {} at {:.0}% — watch it",
-                a.worst.label(),
-                a.worst_sat * 100.0
-            ),
-            Color::Yellow,
-        )
-    } else {
-        (
-            "[!]",
-            format!(
-                "BOTTLENECK: {} saturated at {:.0}%",
-                a.worst.label(),
-                a.worst_sat * 100.0
-            ),
-            Color::Red,
-        )
-    };
-
-    let bold = Style::default().fg(color).add_modifier(Modifier::BOLD);
-    let line = Line::from(vec![
-        Span::styled(format!(" {icon} "), bold),
-        Span::styled(msg, bold),
-    ]);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(color))
-        .title(Span::styled(
-            " sysmon — what's slowing you down ",
-            Style::default().add_modifier(Modifier::BOLD),
+fn render_verdict(f: &mut Frame, area: Rect, a: &Assessment, paused: bool) {
+    let mut spans = vec![Span::styled(
+        " sysmon ",
+        Style::default().add_modifier(Modifier::BOLD | Modifier::DIM),
+    )];
+    // A frozen frame is easy to mistake for a hung one — call it out loudly.
+    if paused {
+        spans.push(Span::styled(
+            " PAUSED ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ));
-    f.render_widget(Paragraph::new(line).block(block), area);
+    }
+
+    // One fixed badge per axis instead of a single "worst" headline. Because each
+    // axis reports its own state in its own fixed slot, the bar no longer flaps:
+    // nothing here changes unless *that* axis actually crosses a threshold, and
+    // the status word is padded to a constant width so columns never shift.
+    let axes = [
+        ("CPU", a.sats[0]),
+        ("MEM", a.sats[1]),
+        ("DISK", a.sats[2]),
+        ("NET", a.sats[3]),
+    ];
+    for (label, sat) in axes {
+        let (word, color) = status_badge(sat);
+        spans.push(Span::styled(
+            format!("   {label} "),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+        spans.push(Span::styled(
+            format!("{word:<9}"),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// A stable per-axis status word + colour from its saturation. Fixed vocabulary
+/// (`ok` / `elevated` / `saturated`) so the verdict bar reads at a glance and,
+/// unlike a live percentage, doesn't churn every tick.
+fn status_badge(sat: f64) -> (&'static str, Color) {
+    if sat < CLEAR {
+        ("ok", Color::Green)
+    } else if sat < SATURATED {
+        ("elevated", Color::Yellow)
+    } else {
+        ("saturated", Color::Red)
+    }
 }
 
 fn render_grid(f: &mut Frame, area: Rect, m: &Metrics, app: &App) {
-    let rows = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area);
-    let top = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(rows[0]);
-    let bot = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(rows[1]);
+    // The one-cell middle tracks are dividers only: unlike pane borders, they
+    // separate neighbours without drawing a box around any section.
+    let rows = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(1),
+        Constraint::Fill(1),
+    ])
+    .split(area);
+    let top = Layout::horizontal([
+        Constraint::Fill(1),
+        Constraint::Length(1),
+        Constraint::Fill(1),
+    ])
+    .split(rows[0]);
+    let bot = Layout::horizontal([
+        Constraint::Fill(1),
+        Constraint::Length(1),
+        Constraint::Fill(1),
+    ])
+    .split(rows[2]);
+    render_grid_dividers(f, area, top[1].x, rows[1].y);
 
-    // CPU
+    // CPU — headline carries load average (run-queue depth incl. D-state), the
+    // per-core strip carries the CPU stall % (PSI) when the kernel provides it.
+    let cpu_head = if m.load.cores > 0 {
+        format!(
+            "{:.0}%   load {:.2} / {}",
+            m.cpu.usage * 100.0,
+            m.load.one,
+            m.load.cores
+        )
+    } else {
+        format!("{:.0}%", m.cpu.usage * 100.0)
+    };
+    let mut cpu_detail = cores_line(&m.cpu.per_core);
+    // Label the strip so it reads as a spatial per-core view, not a second
+    // history sparkline like the one below it.
+    cpu_detail.spans.insert(
+        0,
+        Span::styled("per-core ", Style::default().fg(Color::DarkGray)),
+    );
+    if let Some(s) = stall_span(m.psi.cpu.some) {
+        cpu_detail.spans.push(s);
+    }
     axis_pane(
         f,
         top[0],
         "CPU",
         sat_color(m.cpu.usage),
-        format!("{:.0}%", m.cpu.usage * 100.0),
-        cores_line(&m.cpu.per_core),
+        cpu_head,
+        cpu_detail,
         m.cpu.usage,
         format!("{:.0}%", m.cpu.usage * 100.0),
         &app.h_cpu,
     );
 
     // Memory
+    let mut mem_detail = Line::from(format!(
+        "swap {} / {}{}",
+        fmt_bytes(m.mem.swap_used),
+        fmt_bytes(m.mem.swap_total),
+        if m.mem.swapping { "   swapping" } else { "" }
+    ));
+    if let Some(s) = stall_span(m.psi.mem.some) {
+        mem_detail.spans.push(s);
+    }
     axis_pane(
         f,
-        top[1],
+        top[2],
         "Memory",
         sat_color(m.mem.used_frac),
         format!("{} / {}", fmt_bytes(m.mem.used), fmt_bytes(m.mem.total)),
-        Line::from(format!(
-            "swap {} / {}{}",
-            fmt_bytes(m.mem.swap_used),
-            fmt_bytes(m.mem.swap_total),
-            if m.mem.swapping { "   swapping" } else { "" }
-        )),
+        mem_detail,
         m.mem.used_frac,
         format!("{:.0}%", m.mem.used_frac * 100.0),
         &app.h_mem,
@@ -265,11 +308,20 @@ fn render_grid(f: &mut Frame, area: Rect, m: &Metrics, app: &App) {
             fmt_rate(m.disk.read_bps),
             fmt_rate(m.disk.write_bps)
         ),
-        Line::from(format!(
-            "util {:.0}%    iowait {:.0}%",
-            m.disk.util * 100.0,
-            m.disk.iowait * 100.0
-        )),
+        {
+            // await + aqu-sz make %util legible: they separate slow-and-shallow
+            // (high await, low queue — 100% util at a trickle) from fast-and-deep.
+            let mut d = Line::from(format!(
+                "util {:.0}%   await {}   aqu {:.1}",
+                m.disk.util * 100.0,
+                fmt_latency(m.disk.await_ms),
+                m.disk.aqu_sz,
+            ));
+            if let Some(s) = stall_span(m.psi.io.some) {
+                d.spans.push(s);
+            }
+            d
+        },
         m.disk.util,
         format!("{:.0}%", m.disk.util * 100.0),
         &app.h_disk,
@@ -292,10 +344,14 @@ fn render_grid(f: &mut Frame, area: Rect, m: &Metrics, app: &App) {
     };
     axis_pane(
         f,
-        bot[1],
+        bot[2],
         "Network",
         net_color,
-        format!("Rx {}    Tx {}", fmt_bits(m.net.rx_bps), fmt_bits(m.net.tx_bps)),
+        format!(
+            "Rx {}    Tx {}",
+            fmt_bits(m.net.rx_bps),
+            fmt_bits(m.net.tx_bps)
+        ),
         net_detail,
         net_ratio,
         net_label,
@@ -303,8 +359,27 @@ fn render_grid(f: &mut Frame, area: Rect, m: &Metrics, app: &App) {
     );
 }
 
-/// One axis cell: title border, big headline value, saturation gauge, a detail
-/// line, and a sparkline of recent saturation.
+fn render_grid_dividers(f: &mut Frame, area: Rect, vertical_x: u16, horizontal_y: u16) {
+    let divider = Style::default().fg(Color::DarkGray);
+    let buffer = f.buffer_mut();
+
+    for y in area.y..area.bottom() {
+        if let Some(cell) = buffer.cell_mut((vertical_x, y)) {
+            cell.set_symbol("│").set_style(divider);
+        }
+    }
+    for x in area.x..area.right() {
+        if let Some(cell) = buffer.cell_mut((x, horizontal_y)) {
+            cell.set_symbol("─").set_style(divider);
+        }
+    }
+    if let Some(cell) = buffer.cell_mut((vertical_x, horizontal_y)) {
+        cell.set_symbol("┼").set_style(divider);
+    }
+}
+
+/// One axis cell (borderless): a coloured `Title  headline` line, a saturation
+/// gauge, a detail line, and a sparkline of recent saturation.
 #[allow(clippy::too_many_arguments)]
 fn axis_pane(
     f: &mut Frame,
@@ -317,28 +392,22 @@ fn axis_pane(
     gauge_label: String,
     hist: &History,
 ) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .title(Span::styled(
-            format!(" {title} "),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
     let parts = Layout::vertical([
-        Constraint::Length(1), // headline
+        Constraint::Length(1), // title + headline
         Constraint::Length(1), // gauge
         Constraint::Length(1), // detail
         Constraint::Min(1),    // sparkline
     ])
-    .split(inner);
+    .split(area);
 
-    f.render_widget(
-        Paragraph::new(big).style(Style::default().fg(color).add_modifier(Modifier::BOLD)),
-        parts[0],
-    );
+    let strong = Style::default().fg(color).add_modifier(Modifier::BOLD);
+    // Title and headline share one line now that there's no border to carry the
+    // title; the label stays colour-coded so the four panes read apart.
+    let head = Line::from(vec![
+        Span::styled(format!("{title}  "), strong),
+        Span::styled(big, strong),
+    ]);
+    f.render_widget(Paragraph::new(head), parts[0]);
     f.render_widget(
         Gauge::default()
             .ratio(gauge_ratio.clamp(0.0, 1.0))
@@ -356,6 +425,25 @@ fn axis_pane(
             .data(&data),
         parts[3],
     );
+}
+
+/// A dim "stall N%" span carrying the PSI `some avg10` for an axis — the honest
+/// "tasks were actually delayed this much" figure. `None` when PSI is
+/// unavailable on this kernel, so nothing is drawn.
+fn stall_span(some: Option<f64>) -> Option<Span<'static>> {
+    some.map(|v| {
+        // Tint it toward the saturation palette so a painful stall reads at a
+        // glance without competing with the pane's headline colour.
+        let c = if v < 0.10 {
+            Color::DarkGray
+        } else {
+            sat_color(v)
+        };
+        Span::styled(
+            format!("   stall {:.0}%", v * 100.0),
+            Style::default().fg(c),
+        )
+    })
 }
 
 /// A compact per-core usage strip using block characters, each core coloured by
@@ -394,15 +482,36 @@ fn render_processes(f: &mut Frame, area: Rect, m: &Metrics, a: &Assessment, app:
 
     let procs = ordered_procs(m, sort_axis);
 
+    // Split off a one-line coloured title above the (borderless) table.
+    let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
+    let title_area = parts[0];
+    let table_area = parts[1];
+
+    let title = if net_fallback {
+        "Top processes — 3-sample avg, network N/A, sorted by CPU".to_string()
+    } else {
+        format!(
+            "Top processes by {} — 3-sample rolling average",
+            axis.label()
+        )
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            title,
+            Style::default().add_modifier(Modifier::BOLD),
+        ))),
+        title_area,
+    );
+
     // Locate the followed process in the current order so we can both highlight
     // it and scroll it into view (it may have drifted far down since selection).
     let sel_idx = app
-        .selected_pid
-        .and_then(|pid| procs.iter().position(|p| p.pid == pid));
+        .selected_process
+        .and_then(|identity| procs.iter().position(|p| p.identity == identity));
 
-    let visible = area.height.saturating_sub(3) as usize; // borders + header
-    // Keep the selected row roughly centred so the eye can follow it as the
-    // sort reshuffles; clamp so we never scroll past the ends.
+    let visible = table_area.height.saturating_sub(1) as usize; // header row
+                                                                // Keep the selected row roughly centred so the eye can follow it as the
+                                                                // sort reshuffles; clamp so we never scroll past the ends.
     let max_scroll = procs.len().saturating_sub(visible);
     let scroll = match sel_idx {
         Some(i) if procs.len() > visible => i.saturating_sub(visible / 2).min(max_scroll),
@@ -423,12 +532,13 @@ fn render_processes(f: &mut Frame, area: Rect, m: &Metrics, a: &Assessment, app:
         .take(visible)
         .map(|(i, p)| {
             let row = Row::new(vec![
-                p.pid.to_string(),
-                truncate(&p.comm, 24),
-                format!("{:.1}", p.cpu_frac * 100.0),
-                fmt_bytes(p.rss),
-                fmt_io(p.io_read_bps),
-                fmt_io(p.io_write_bps),
+                Cell::from(p.pid.to_string()),
+                Cell::from(truncate(&p.comm, 25)),
+                Cell::from(p.state.to_string()).style(state_style(p.state)),
+                Cell::from(format!("{:.1}", p.cpu_frac * 100.0)),
+                Cell::from(fmt_bytes(p.rss)),
+                Cell::from(fmt_io(p.io_read_bps)),
+                Cell::from(fmt_io(p.io_write_bps)),
             ]);
             if Some(i) == sel_idx {
                 row.style(sel_style)
@@ -442,28 +552,21 @@ fn render_processes(f: &mut Frame, area: Rect, m: &Metrics, a: &Assessment, app:
         })
         .collect();
 
-    let header = Row::new(vec!["PID", "COMMAND", "CPU%", "RSS", "RD/s", "WR/s"])
+    let header = Row::new(vec!["PID", "COMMAND", "S", "CPU%", "RSS", "RD/s", "WR/s"])
         .style(Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED));
 
     let widths = [
         Constraint::Length(7),
-        Constraint::Min(16),
+        Constraint::Min(17),
+        Constraint::Length(1),
         Constraint::Length(7),
         Constraint::Length(10),
         Constraint::Length(11),
         Constraint::Length(11),
     ];
 
-    let title = if net_fallback {
-        " Top processes — per-process network N/A, sorted by CPU ".to_string()
-    } else {
-        format!(" Top processes by {} ", axis.label())
-    };
-
-    let table = Table::new(rows, widths)
-        .header(header)
-        .block(title_block(&title));
-    f.render_widget(table, area);
+    let table = Table::new(rows, widths).header(header);
+    f.render_widget(table, table_area);
 }
 
 /// Sort descending by the chosen axis, then break ties by CPU, then RSS — so
@@ -478,6 +581,18 @@ fn sort_key(p: &ProcSample, axis: Axis) -> (f64, f64, f64) {
         Axis::Network => p.cpu_frac,
     };
     (primary, p.cpu_frac, p.rss as f64)
+}
+
+/// Colour a process state char so the interesting ones pop: `D` (uninterruptible
+/// sleep — blocked on I/O, the answer to "who's stuck?") in bold red, `R`
+/// (running) green, `Z` (zombie) magenta, everything else dim.
+fn state_style(state: char) -> Style {
+    match state {
+        'D' => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        'R' => Style::default().fg(Color::Green),
+        'Z' => Style::default().fg(Color::Magenta),
+        _ => Style::default().fg(Color::DarkGray),
+    }
 }
 
 /// Format a per-process I/O rate, showing `—` when the counter was unreadable
@@ -514,8 +629,12 @@ fn render_help(f: &mut Frame, area: Rect) {
         Span::raw(" next   "),
         Span::styled(" ↑↓ ", key),
         Span::raw(" select   "),
+        Span::styled(" Home/End PgUp/Dn ", key),
+        Span::raw(" jump   "),
         Span::styled(" F9 ", key),
-        Span::raw(" kill"),
+        Span::raw(" kill process   "),
+        Span::styled(" spc ", key),
+        Span::raw(" pause"),
     ]);
     f.render_widget(Paragraph::new(help), area);
 }
@@ -555,8 +674,8 @@ mod tests {
 
         // Follow the last process in sort order — exercises the scroll path.
         let axis = app.sort_axis(m);
-        let last = ordered_procs(m, axis).last().map(|p| p.pid);
-        app.selected_pid = last;
+        let last = ordered_procs(m, axis).last().map(|p| p.identity);
+        app.selected_process = last;
 
         for mode in [InputMode::Normal, InputMode::Search, InputMode::Kill] {
             app.mode = mode;
@@ -570,6 +689,28 @@ mod tests {
         app.status = Some(("Sent SIGTERM to 1234 (foo)".to_string(), 2));
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|f| render(f, &app)).unwrap();
+    }
+
+    #[test]
+    fn grid_dividers_separate_sections_without_surrounding_them() {
+        let mut terminal = Terminal::new(TestBackend::new(11, 7)).unwrap();
+        terminal
+            .draw(|f| render_grid_dividers(f, Rect::new(1, 1, 9, 5), 5, 3))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        for y in 1..6 {
+            assert_eq!(buffer[(5, y)].symbol(), if y == 3 { "┼" } else { "│" });
+        }
+        for x in 1..10 {
+            assert_eq!(buffer[(x, 3)].symbol(), if x == 5 { "┼" } else { "─" });
+        }
+
+        // Divider endpoints stop at the grid's edges; no line turns a corner and
+        // continues around a section as a border would.
+        for (x, y) in [(1, 1), (9, 1), (1, 5), (9, 5), (5, 0), (0, 3), (10, 3)] {
+            assert_eq!(buffer[(x, y)].symbol(), " ");
+        }
     }
 
     /// The "collecting" first-frame path (metrics still None) must also render.
